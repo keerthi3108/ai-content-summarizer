@@ -34,6 +34,11 @@ except Exception:
     OpenAI = None
 
 try:
+    from langsmith import traceable
+except Exception:
+    traceable = None
+
+try:
     import textstat
 except Exception:
     textstat = None
@@ -695,6 +700,30 @@ def safe_secret(name: str) -> str:
         return ""
 
 
+def configure_langsmith(enabled: bool, api_key: str, project: str, endpoint: str = "") -> None:
+    st.session_state["langsmith_enabled"] = bool(enabled and api_key and traceable)
+    st.session_state["langsmith_project"] = project or "ai-content-summarizer"
+    if enabled and api_key:
+        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_API_KEY"] = api_key
+        os.environ["LANGSMITH_PROJECT"] = project or "ai-content-summarizer"
+        if endpoint:
+            os.environ["LANGSMITH_ENDPOINT"] = endpoint
+    else:
+        os.environ["LANGSMITH_TRACING"] = "false"
+
+
+def langsmith_trace(name: str, run_type: str, inputs: Dict, operation):
+    if not st.session_state.get("langsmith_enabled") or not traceable:
+        return operation()
+
+    @traceable(name=name, run_type=run_type)
+    def traced_operation(payload: Dict):
+        return operation()
+
+    return traced_operation(inputs)
+
+
 with st.sidebar:
     st.markdown("## AI Summarizer")
     st.caption("Research, learning, and productivity workspace")
@@ -717,6 +746,31 @@ with st.sidebar:
         api_key = ""
         model = "local"
         st.info("Local mode uses extractive summaries and analytics.")
+    st.divider()
+    st.markdown("### LangSmith")
+    default_langsmith = safe_secret("LANGSMITH_API_KEY") or os.getenv("LANGSMITH_API_KEY", "")
+    langsmith_enabled = st.toggle(
+        "Enable tracing",
+        value=bool(default_langsmith),
+        help="Send summary and chat runs to LangSmith for observability. Inputs and outputs may be visible in LangSmith.",
+    )
+    langsmith_key = st.text_input("LangSmith API Key", value=default_langsmith, type="password")
+    langsmith_project = st.text_input(
+        "LangSmith Project",
+        value=safe_secret("LANGSMITH_PROJECT") or os.getenv("LANGSMITH_PROJECT", "ai-content-summarizer"),
+    )
+    langsmith_endpoint = st.text_input(
+        "LangSmith Endpoint",
+        value=safe_secret("LANGSMITH_ENDPOINT") or os.getenv("LANGSMITH_ENDPOINT", ""),
+        placeholder="Optional, e.g. https://eu.api.smith.langchain.com",
+    )
+    configure_langsmith(langsmith_enabled, langsmith_key, langsmith_project, langsmith_endpoint)
+    if langsmith_enabled and not traceable:
+        st.warning("Install langsmith from requirements.txt to enable tracing.")
+    elif st.session_state.get("langsmith_enabled"):
+        st.success("LangSmith tracing is enabled.")
+    else:
+        st.caption("Tracing is off. The app still works normally.")
     st.divider()
     mode = st.radio("Explanation Mode", ["Beginner", "Expert"], horizontal=True)
     language = st.selectbox(
@@ -838,14 +892,29 @@ if nav == "Summarizer":
                     st.success(f"Loaded {len(words(text)):,} words from {title}.")
                     if load_summary:
                         with st.spinner("Loading and generating summary..."):
-                            st.session_state.summary = call_ai(
-                                text,
-                                provider,
-                                api_key,
-                                model,
-                                language,
-                                mode,
-                                "Executive Summary",
+                            st.session_state.summary = langsmith_trace(
+                                "load_and_summarize",
+                                "chain",
+                                {
+                                    "title": title,
+                                    "source_type": source_type,
+                                    "provider": provider,
+                                    "model": model,
+                                    "language": language,
+                                    "mode": mode,
+                                    "style": "Executive Summary",
+                                    "word_count": len(words(text)),
+                                    "char_count": len(text),
+                                },
+                                lambda: call_ai(
+                                    text,
+                                    provider,
+                                    api_key,
+                                    model,
+                                    language,
+                                    mode,
+                                    "Executive Summary",
+                                ),
                             )
                             db().table("summaries").insert({
                                 "document_id": st.session_state.active_record["id"],
@@ -883,7 +952,22 @@ if nav == "Summarizer":
                 )
                 if st.button("Generate Summary", use_container_width=True):
                     with st.spinner("Thinking through the document..."):
-                        st.session_state.summary = call_ai(text, provider, api_key, model, language, mode, style)
+                        st.session_state.summary = langsmith_trace(
+                            "generate_summary",
+                            "chain",
+                            {
+                                "title": record.get("title", "Untitled content"),
+                                "source_type": record.get("source_type", "Content"),
+                                "provider": provider,
+                                "model": model,
+                                "language": language,
+                                "mode": mode,
+                                "style": style,
+                                "word_count": metrics["words"],
+                                "char_count": metrics["chars"],
+                            },
+                            lambda: call_ai(text, provider, api_key, model, language, mode, style),
+                        )
                         db().table("summaries").insert({
                             "document_id": record["id"],
                             "created_at": now_label(),
@@ -910,7 +994,23 @@ if nav == "Summarizer":
                     if tool_cols[idx % 2].button(label, use_container_width=True):
                         with st.spinner("Creating polished output..."):
                             extra = "Make the explanation extra accessible for a beginner." if "beginners" in label else ""
-                            st.session_state.summary = call_ai(text, provider, api_key, model, language, "Beginner" if "beginners" in label else mode, style_name, extra)
+                            trace_mode = "Beginner" if "beginners" in label else mode
+                            st.session_state.summary = langsmith_trace(
+                                "standout_summary_tool",
+                                "chain",
+                                {
+                                    "tool": label,
+                                    "title": record.get("title", "Untitled content"),
+                                    "provider": provider,
+                                    "model": model,
+                                    "language": language,
+                                    "mode": trace_mode,
+                                    "style": style_name,
+                                    "word_count": metrics["words"],
+                                    "char_count": metrics["chars"],
+                                },
+                                lambda: call_ai(text, provider, api_key, model, language, trace_mode, style_name, extra),
+                            )
                 if st.session_state.summary:
                     st.markdown(f"<div class='summary-box'>{st.session_state.summary}</div>", unsafe_allow_html=True)
 
@@ -1003,15 +1103,28 @@ elif nav == "AI Chat":
                 with st.spinner("Reading the document context..."):
                     context_df = semantic_search(text, question, 6)
                     context = "\n".join(context_df["passage"].tolist())
-                    answer = call_ai(
-                        context or text[:8000],
-                        provider,
-                        api_key,
-                        model,
-                        language,
-                        mode,
-                        "Detailed Summary",
-                        extra=f"Answer this user question using only the supplied content: {question}",
+                    answer = langsmith_trace(
+                        "content_chat",
+                        "chain",
+                        {
+                            "question": question,
+                            "provider": provider,
+                            "model": model,
+                            "language": language,
+                            "mode": mode,
+                            "retrieved_passages": len(context_df),
+                            "context_chars": len(context),
+                        },
+                        lambda: call_ai(
+                            context or text[:8000],
+                            provider,
+                            api_key,
+                            model,
+                            language,
+                            mode,
+                            "Detailed Summary",
+                            extra=f"Answer this user question using only the supplied content: {question}",
+                        ),
                     )
                     st.markdown(answer)
             st.session_state.chat_messages.append({"role": "assistant", "content": answer})
